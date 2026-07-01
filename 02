@@ -1,0 +1,1617 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# 실습 5: 토픽 모델링 & 비지도 학습(군집) 개념 체험\n",
+    "**소요시간: 30분** | 난이도: ⭐⭐⭐\n",
+    "\n",
+    "## 학습 목표\n",
+    "1. **지도학습(분류)** 과 **비지도학습(군집·토픽)** 의 차이를 이해합니다.\n",
+    "2. Amazon Comprehend의 **관리형 토픽 모델링** API 흐름을 개요로 파악합니다.\n",
+    "3. **KMeans 군집화**로 라벨 없이 토픽이 자동으로 묶이는 과정을 직접 체험합니다.\n",
+    "\n",
+    "## 지도학습 vs 비지도학습\n",
+    "| 구분 | 지도학습 (앞의 실습들) | 비지도학습 (이번 실습) |\n",
+    "|---|---|---|\n",
+    "| 정답 라벨 | 있음 (긍정/부정 등) | **없음** |\n",
+    "| 하는 일 | 분류·예측 | **비슷한 것끼리 묶기(군집)** |\n",
+    "| 예시 | 감성 분석, 개체 인식 | **토픽 모델링, 클러스터링** |\n",
+    "\n",
+    "> 토픽 모델링 = \"이 많은 문서에 *어떤 주제들이* 있는지\" 라벨 없이 자동으로 발견하는 것."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "---\n",
+    "## 🏢 기업 시나리오 — 리뷰 속 '숨은 주제' 자동 발견\n",
+    "\n",
+    "당신은 이커머스 **CX 분석가**입니다. 수천 건의 리뷰가 쌓였는데,\n",
+    "누구도 '배송/품질/가격/상담' 같은 라벨을 미리 달아두지 않았습니다.\n",
+    "\n",
+    "**라벨 없이** 비슷한 리뷰끼리 자동으로 묶어 \"요즘 어떤 주제가 많은지\"를 파악하고 싶습니다.\n",
+    "이것이 **비지도 학습 = 군집(클러스터링)** 이고, Comprehend의 **토픽 모델링**이 관리형으로 해줍니다.\n",
+    "\n",
+    "> 💡 감성 분석이 '이 리뷰가 긍정인가?'(지도)라면, 토픽 모델링은 '리뷰들이 무슨 주제로 나뉘나?'(비지도)를 답합니다."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "# ✅ [제공 코드] 환경 초기화\n",
+    "import boto3, sys, subprocess\n",
+    "import pandas as pd\n",
+    "import matplotlib.pyplot as plt\n",
+    "\n",
+    "# 한글 폰트 + scikit-learn (SageMaker Studio: 최초 1회 설치)\n",
+    "try:\n",
+    "    import koreanize_matplotlib\n",
+    "except ImportError:\n",
+    "    subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', 'koreanize-matplotlib'])\n",
+    "    import koreanize_matplotlib\n",
+    "try:\n",
+    "    import sklearn\n",
+    "except ImportError:\n",
+    "    subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', 'scikit-learn'])\n",
+    "\n",
+    "comprehend = boto3.client('comprehend', region_name='ap-northeast-2')\n",
+    "print('✅ 환경 초기화 완료')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 📖 [개요] Amazon Comprehend 관리형 토픽 모델링\n",
+    "\n",
+    "실무에서 **수천~수만 건** 문서의 토픽을 뽑을 때는 Comprehend의 관리형 토픽 모델링을 씁니다.\n",
+    "S3에 문서를 올리고 **비동기 잡(job)** 을 제출하면 Comprehend가 토픽을 자동 추출합니다.\n",
+    "\n",
+    "> ⚠️ 이 잡은 완료까지 보통 **수십 분**이 걸립니다. 그래서 아래는 **흐름 참고용** 코드이고,\n",
+    "> 즉시 체험은 다음 셀부터 **KMeans 군집**으로 진행합니다."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "# 📖 [참고 코드] Comprehend 토픽 모델링은 이렇게 '비동기 잡'으로 실행됩니다 (실행 X)\n",
+    "def run_comprehend_topic_modeling(input_s3, output_s3, role_arn, num_topics=10):\n",
+    "    response = comprehend.start_topics_detection_job(\n",
+    "        InputDataConfig={'S3Uri': input_s3, 'InputFormat': 'ONE_DOC_PER_LINE'},\n",
+    "        OutputDataConfig={'S3Uri': output_s3},\n",
+    "        DataAccessRoleArn=role_arn,\n",
+    "        NumberOfTopics=num_topics,\n",
+    "    )\n",
+    "    return response['JobId']\n",
+    "\n",
+    "# 결과물(완료 후 output S3):\n",
+    "#   - topic-terms.csv : 토픽별 핵심 단어\n",
+    "#   - doc-topics.csv  : 문서별로 배정된 토픽\n",
+    "print('참고: Comprehend 토픽 모델링은 S3 + 비동기 잡으로 동작합니다 (수십 분 소요).')\n",
+    "print('아래에서는 같은 개념(비지도 군집)을 즉시 체험합니다.')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## ✏️ TODO 1: 문서 벡터화 (텍스트 → 숫자)\n",
+    "\n",
+    "군집을 하려면 먼저 문장을 숫자(벡터)로 바꿔야 합니다. **TF-IDF** 는 각 문서에서\n",
+    "'자주·특징적으로 등장하는 단어'에 가중치를 줘서 벡터로 만듭니다."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "# ✏️ TODO 1: 샘플 리뷰를 TF-IDF로 벡터화하세요\n",
+    "from sklearn.feature_extraction.text import TfidfVectorizer\n",
+    "\n",
+    "# 토픽이 또렷한 샘플 리뷰 (배송 / 품질 / 가격·환불 / 상담)\n",
+    "sample_docs = [\n",
+    "    '배송 속도가 느리고 배송이 일주일 걸렸어요',\n",
+    "    '배송 박스가 찌그러져서 왔어요',\n",
+    "    '배송 빨라서 좋고 당일 배송 편리해요',\n",
+    "    '배송 기사님 친절하고 배송 상태 좋아요',\n",
+    "    '제품 품질이 사진과 달라 품질 실망이에요',\n",
+    "    '원단 품질 훌륭하고 품질 튼튼해요',\n",
+    "    '품질 금방 망가지고 품질 별로예요',\n",
+    "    '마감 품질 깔끔하고 품질 만족해요',\n",
+    "    '가격 비싸고 환불 원하는데 환불 안돼요',\n",
+    "    '가격 합리적이고 가격 가성비 좋아요',\n",
+    "    '환불 절차 복잡하고 환불 느려요',\n",
+    "    '할인 가격 저렴해서 가격 만족해요',\n",
+    "    '상담 직원이 불친절하고 상담 별로예요',\n",
+    "    '상담 답변 빠르고 상담 친절해요',\n",
+    "    '상담 연결 오래 걸리고 상담 불편해요',\n",
+    "    '고객센터 상담 만족하고 상담 좋아요',\n",
+    "]\n",
+    "\n",
+    "# 일반적인 단어(불용어)는 토픽 구분에 도움이 안 되므로 제거합니다\n",
+    "STOPWORDS = ['너무','정말','아주','매우','그냥','좋아요','좋고','걸렸어요','걸리고',\n",
+    "             '왔어요','만족해요','편리해요','친절해요','달라','안돼요','원하는데',\n",
+    "             '저렴해서','빠르고','느리고','느려요','복잡하고','깔끔하고','훌륭하고',\n",
+    "             '튼튼해요','불친절하고','별로예요','실망이에요','망가지고','찌그러져서']\n",
+    "\n",
+    "vectorizer = TfidfVectorizer(token_pattern=r\"(?u)\\b\\w+\\b\", stop_words=STOPWORDS)\n",
+    "X = vectorizer.fit_transform(_____)    # ← sample_docs\n",
+    "print('문서 수:', X.shape[0], '| 단어(특성) 수:', X.shape[1])"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## ✏️ TODO 2: KMeans 군집화 — 라벨 없이 토픽 묶기\n",
+    "\n",
+    "**KMeans** 는 비슷한 벡터끼리 K개의 그룹(군집)으로 묶는 대표적인 비지도 학습입니다.\n",
+    "여기서는 토픽 4개(배송 / 품질 / 가격·환불 / 상담)를 기대하고 K=4로 묶어봅니다."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "# ✏️ TODO 2: KMeans로 문서를 4개 토픽으로 군집화하세요\n",
+    "from sklearn.cluster import KMeans\n",
+    "\n",
+    "NUM_TOPICS = 4\n",
+    "km = KMeans(n_clusters=_____, random_state=42, n_init=10)   # ← NUM_TOPICS\n",
+    "labels = km.fit_predict(_____)                              # ← X\n",
+    "\n",
+    "print('문서별 자동 배정 토픽 (라벨 없이 묶인 결과):')\n",
+    "print('-' * 50)\n",
+    "for i, doc in enumerate(sample_docs):\n",
+    "    print(f'  [토픽 {labels[i]}]  {doc}')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "# ✅ [제공 코드] 토픽별 대표 단어 + 군집 크기 시각화\n",
+    "import numpy as np\n",
+    "terms = vectorizer.get_feature_names_out()\n",
+    "\n",
+    "print('🔑 토픽별 대표 단어 (군집 중심에서 가중치 높은 단어):')\n",
+    "for c in range(NUM_TOPICS):\n",
+    "    top_idx = km.cluster_centers_[c].argsort()[::-1][:5]\n",
+    "    print(f'  토픽 {c}: {[terms[i] for i in top_idx]}')\n",
+    "\n",
+    "counts = pd.Series(labels).value_counts().sort_index()\n",
+    "plt.figure(figsize=(7, 4))\n",
+    "plt.bar([f'토픽 {i}' for i in counts.index], counts.values, color='#3498db')\n",
+    "plt.title('토픽(군집)별 리뷰 수')\n",
+    "plt.ylabel('문서 수')\n",
+    "plt.tight_layout()\n",
+    "plt.show()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## ✏️ TODO 3: 새 리뷰는 어느 토픽일까?\n",
+    "\n",
+    "학습된 군집 모델로 **새 리뷰**가 어느 토픽에 속하는지 예측해봅니다."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "# ✏️ TODO 3: 새 리뷰를 같은 vectorizer로 변환하고 토픽을 예측하세요\n",
+    "new_reviews = [\n",
+    "    '배송 상자가 또 찌그러져서 왔어요',\n",
+    "    '환불 절차가 복잡하고 가격도 비싸요',\n",
+    "    '상담 직원이 빠르게 답변했어요',\n",
+    "]\n",
+    "\n",
+    "new_X = vectorizer.transform(_____)    # ← new_reviews\n",
+    "pred  = km.predict(_____)              # ← new_X\n",
+    "\n",
+    "for review, topic in zip(new_reviews, pred):\n",
+    "    print(f'  [토픽 {topic}]  {review}')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "---\n",
+    "## 🔗 실무로 연결하기\n",
+    "\n",
+    "오늘 체험한 '라벨 없이 묶기'가 실무에서는 이렇게 쓰입니다.\n",
+    "\n",
+    "`수천 건 리뷰·VOC` → `토픽 모델링(군집)` → `토픽별 비중·추이` → `대시보드`\n",
+    "\n",
+    "- **신상품 출시 후** 어떤 주제(배송·품질·가격)의 언급이 급증하는지 자동 포착\n",
+    "- 라벨을 미리 만들 수 없는 **새로운 이슈**도 군집으로 드러남 (지도학습의 한계 보완)\n",
+    "- 대량·정기 분석은 Comprehend **관리형 토픽 모델링**(비동기 잡)으로 자동화\n",
+    "- 군집 결과에 **감성 분석(Lab 1)** 을 결합하면 '어떤 주제가 부정적인지'까지 파악"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 💡 심화 도전\n",
+    "1. `NUM_TOPICS` 를 3, 5, 6으로 바꿔가며 군집이 어떻게 달라지는지 관찰하세요.\n",
+    "2. 실제 리뷰 30개를 직접 입력해 토픽을 뽑아보세요.\n",
+    "3. 각 토픽의 리뷰에 Lab 1의 `detect_sentiment` 를 적용해 '토픽별 평균 감성'을 구해보세요."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## ✅ 정답 코드\n",
+    "\n",
+    "👆 모두 풀고 난 후 확인하세요\n",
+    "\n",
+    "```python\n",
+    "# TODO 1\n",
+    "X = vectorizer.fit_transform(sample_docs)\n",
+    "\n",
+    "# TODO 2\n",
+    "km = KMeans(n_clusters=NUM_TOPICS, random_state=42, n_init=10)\n",
+    "labels = km.fit_predict(X)\n",
+    "\n",
+    "# TODO 3\n",
+    "new_X = vectorizer.transform(new_reviews)\n",
+    "pred  = km.predict(new_X)\n",
+    "```"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "name": "python"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "id": "s1_00",
+   "metadata": {},
+   "source": [
+    "# 실습 1: 언어 감지 & 감성 분석\n",
+    "**소요시간: 30분** | 난이도: ⭐⭐\n",
+    "\n",
+    "## 학습 목표\n",
+    "1. `detect_dominant_language`로 텍스트의 언어를 자동 감지합니다.\n",
+    "2. `detect_sentiment`로 문서 전체의 감성(긍정/부정/중립/혼합)을 분석합니다.\n",
+    "3. `batch_detect_sentiment`로 여러 문서를 한 번에 처리합니다.\n",
+    "\n",
+    "## API 개요\n",
+    "```python\n",
+    "# 언어 감지\n",
+    "comprehend.detect_dominant_language(Text='...')\n",
+    "\n",
+    "# 감성 분석\n",
+    "comprehend.detect_sentiment(Text='...', LanguageCode='ko')\n",
+    "\n",
+    "# 배치 감성 분석 (최대 25개)\n",
+    "comprehend.batch_detect_sentiment(TextList=[...], LanguageCode='ko')\n",
+    "```\n",
+    "\n",
+    "### 감성 결과 구조\n",
+    "```\n",
+    "{\n",
+    "  'Sentiment': 'POSITIVE' | 'NEGATIVE' | 'NEUTRAL' | 'MIXED',\n",
+    "  'SentimentScore': {\n",
+    "    'Positive': 0.98, 'Negative': 0.01,\n",
+    "    'Neutral': 0.01,  'Mixed': 0.00\n",
+    "  }\n",
+    "}\n",
+    "```\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "---\n",
+    "## 🏢 기업 시나리오 — 글로벌 이커머스 'ShopGlobal' 고객경험(CX)팀\n",
+    "\n",
+    "당신은 글로벌 온라인 쇼핑몰의 **CX 데이터 분석가**입니다.\n",
+    "전 세계에서 **하루 수만 건**의 상품 리뷰가 한국어·영어·일본어 등 여러 언어로 쏟아집니다.\n",
+    "사람이 일일이 다 읽는 것은 불가능합니다.\n",
+    "\n",
+    "이번 실습에서는 Comprehend로 다음을 자동화합니다.\n",
+    "1. **언어 자동 감지** → 리뷰를 해당 언어 CS팀으로 라우팅\n",
+    "2. **감성 분석** → 부정 리뷰를 가려내 우선 대응 큐로 전달\n",
+    "3. **배치 처리** → 수천 건 리뷰를 한 번의 호출로 대량 분석\n",
+    "\n",
+    "> 💡 실무에서는 이 과정을 매일 밤 자동 실행해, 다음 날 아침 CX팀이 '어제의 부정 리뷰 Top 10' 대시보드를 받아봅니다.\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "s1_01",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# ✅ [제공 코드] 환경 초기화\n",
+    "import boto3, json\n",
+    "import matplotlib.pyplot as plt\n",
+    "import pandas as pd\n",
+    "\n",
+    "# 한글 폰트 설정 (SageMaker Studio) — 최초 1회만 설치, 이후 즉시 로드\n",
+    "try:\n",
+    "    import koreanize_matplotlib\n",
+    "except ImportError:\n",
+    "    import sys, subprocess\n",
+    "    subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', 'koreanize-matplotlib'])\n",
+    "    import koreanize_matplotlib\n",
+    "\n",
+    "# Comprehend는 한국어 감성·개체 분석을 지원하므로 서울 리전을 사용합니다\n",
+    "comprehend = boto3.client('comprehend', region_name='ap-northeast-2')\n",
+    "print('✅ Comprehend 클라이언트 생성 완료 (서울 ap-northeast-2)')\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "s1_02",
+   "metadata": {},
+   "source": [
+    "## ✏️ TODO 1: detect_dominant_language — 언어 감지\n",
+    "\n",
+    "다국어 텍스트 목록에서 각 문장의 언어를 자동으로 감지하세요.\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "s1_03",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# ✏️ TODO 1: 언어 감지 API를 호출하고 결과를 출력하세요\n",
+    "texts = [\n",
+    "    '배송이 빠르고 포장도 꼼꼼했어요. 재구매 의사 있습니다.',\n",
+    "    'The fabric quality is amazing for the price. Highly recommend!',\n",
+    "    'サイズが小さめなので、ワンサイズ大きめがおすすめです。',\n",
+    "    'La couleur est un peu differente de la photo, mais je suis satisfaite.',\n",
+    "]\n",
+    "\n",
+    "print('언어 감지 결과:')\n",
+    "print('-' * 55)\n",
+    "for text in texts:\n",
+    "    response = comprehend.detect_dominant_language(\n",
+    "        Text=_____  # ← text\n",
+    "    )\n",
+    "    top = response['Languages'][0]\n",
+    "    lang_code = top[_____]    # ← 'LanguageCode'\n",
+    "    score     = top[_____]    # ← 'Score'\n",
+    "    print(f'  [{lang_code}] {score:.3f}  {text[:30]}')\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "s1_04",
+   "metadata": {},
+   "source": [
+    "## ✏️ TODO 2: detect_sentiment — 단일 문서 감성 분석\n",
+    "\n",
+    "리뷰 텍스트의 감성과 각 감성 점수를 출력하세요.\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "s1_05",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# ✏️ TODO 2: 감성 분석 API를 호출하고 결과를 출력하세요\n",
+    "reviews = [\n",
+    "    '이 제품 정말 최고예요! 배송도 빠르고 품질도 훌륭합니다.',\n",
+    "    '완전 실망입니다. 사진과 너무 다르고 품질이 형편없어요.',\n",
+    "    '그냥 평범한 제품이에요. 나쁘지도 좋지도 않습니다.',\n",
+    "    '좋은 점도 있고 아쉬운 점도 있어요. 가격 대비는 괜찮네요.',\n",
+    "]\n",
+    "\n",
+    "results = []\n",
+    "for review in reviews:\n",
+    "    response = comprehend.detect_sentiment(\n",
+    "        Text=_____,           # ← review\n",
+    "        LanguageCode=_____    # ← 'ko'\n",
+    "    )\n",
+    "    sentiment = response[_____]        # ← 'Sentiment'\n",
+    "    scores    = response[_____]        # ← 'SentimentScore'\n",
+    "    results.append({'text': review[:25], 'sentiment': sentiment, 'scores': scores})\n",
+    "    print(f'  {sentiment:<10} | {review[:30]}')\n",
+    "\n",
+    "print('\\n상세 점수 (첫 번째 리뷰):')\n",
+    "for k, v in results[0]['scores'].items():\n",
+    "    print(f'  {k:<12}: {v:.4f}')\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "s1_06",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# ✅ [제공 코드] 감성 점수 시각화\n",
+    "fig, axes = plt.subplots(1, len(results), figsize=(14, 4))\n",
+    "colors = {'POSITIVE':'#2ecc71','NEGATIVE':'#e74c3c','NEUTRAL':'#95a5a6','MIXED':'#f39c12'}\n",
+    "labels = ['Positive','Negative','Neutral','Mixed']\n",
+    "for ax, r in zip(axes, results):\n",
+    "    vals = [r['scores']['Positive'], r['scores']['Negative'],\n",
+    "            r['scores']['Neutral'],  r['scores']['Mixed']]\n",
+    "    bar_colors = [colors[l.upper()] for l in labels]\n",
+    "    ax.bar(labels, vals, color=bar_colors)\n",
+    "    ax.set_title(f\"{r['sentiment']}\\n{r['text']}...\", fontsize=8)\n",
+    "    ax.set_ylim(0, 1)\n",
+    "    ax.set_ylabel('Score')\n",
+    "plt.suptitle('감성 분석 점수 분포', fontsize=13)\n",
+    "plt.tight_layout()\n",
+    "plt.show()\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "s1_07",
+   "metadata": {},
+   "source": [
+    "## ✏️ TODO 3: batch_detect_sentiment — 배치 처리\n",
+    "\n",
+    "여러 문서를 한 번의 API 호출로 처리하고 결과를 DataFrame으로 정리하세요.\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "s1_08",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# ✏️ TODO 3: batch_detect_sentiment로 여러 문서를 한 번에 분석하세요\n",
+    "batch_texts = [\n",
+    "    '사이즈가 딱 맞고 색상도 화면이랑 똑같아요.',\n",
+    "    '배송이 일주일 넘게 걸렸어요. 너무 느립니다.',\n",
+    "    '가성비 최고입니다. 친구에게도 추천했어요.',\n",
+    "    '주문한 색상과 다른 색이 왔어요. 교환 요청합니다.',\n",
+    "    '품질 대비 가격이 합리적이에요. 만족합니다.',\n",
+    "]\n",
+    "\n",
+    "response = comprehend.batch_detect_sentiment(\n",
+    "    TextList=_____,       # ← batch_texts\n",
+    "    LanguageCode=_____    # ← 'ko'\n",
+    ")\n",
+    "\n",
+    "rows = []\n",
+    "for item in response[_____]:  # ← 'ResultList'\n",
+    "    idx  = item['Index']\n",
+    "    sent = item['Sentiment']\n",
+    "    pos  = item['SentimentScore']['Positive']\n",
+    "    neg  = item['SentimentScore']['Negative']\n",
+    "    rows.append({'텍스트': batch_texts[idx][:20], '감성': sent,\n",
+    "                 'Positive': round(pos,3), 'Negative': round(neg,3)})\n",
+    "\n",
+    "df = pd.DataFrame(rows)\n",
+    "print(df.to_string(index=False))\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "---\n",
+    "## 🔗 실무로 연결하기\n",
+    "\n",
+    "오늘 만든 3개의 분석(언어감지 → 감성 → 배치)이 실제 서비스에서는 이렇게 연결됩니다.\n",
+    "\n",
+    "`S3(리뷰 적재)` → `Lambda(Comprehend 호출)` → `DynamoDB/RDS(결과 저장)` → `대시보드/알림`\n",
+    "\n",
+    "- 부정 감성 + 높은 신뢰도 리뷰는 **Slack 알림**으로 CS 리더에게 즉시 전달\n",
+    "- 언어별 리뷰 비율을 집계하면 **어느 국가 시장이 성장 중인지** 한눈에 파악\n",
+    "- 사람이 읽는 시간을 줄여 **CS 대응 속도(SLA)** 를 단축\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "s1_09",
+   "metadata": {},
+   "source": [
+    "## 💡 심화 도전\n",
+    "1. 영어 텍스트와 한국어 텍스트의 감성 분석 결과를 비교해보세요.\n",
+    "2. 부정적 리뷰만 필터링하여 Confidence가 높은 순으로 정렬해보세요.\n",
+    "3. 실제 상품 리뷰 10개를 입력하여 긍정/부정 비율을 파이차트로 시각화하세요.\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "s1_10",
+   "metadata": {},
+   "source": [
+    "## ✅ 정답 코드\n",
+    "\n",
+    "👆 모두 풀고 난 후 확인하세요\n",
+    "\n",
+    "```python\n",
+    "# TODO 1\n",
+    "response = comprehend.detect_dominant_language(Text=text)\n",
+    "lang_code = top['LanguageCode']\n",
+    "score     = top['Score']\n",
+    "\n",
+    "# TODO 2\n",
+    "response = comprehend.detect_sentiment(Text=review, LanguageCode='ko')\n",
+    "sentiment = response['Sentiment']\n",
+    "scores    = response['SentimentScore']\n",
+    "\n",
+    "# TODO 3\n",
+    "response = comprehend.batch_detect_sentiment(TextList=batch_texts, LanguageCode='ko')\n",
+    "for item in response['ResultList']:\n",
+    "```\n"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3 (ipykernel)",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.12.13"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "id": "s2_00",
+   "metadata": {},
+   "source": [
+    "# 실습 2: 개체 인식(NER) & 핵심 문구 추출\n",
+    "**소요시간: 30분** | 난이도: ⭐⭐⭐\n",
+    "\n",
+    "## 학습 목표\n",
+    "1. `detect_entities`로 텍스트에서 인물·장소·조직·날짜 등을 추출합니다.\n",
+    "2. `detect_key_phrases`로 문서의 핵심 명사구를 추출합니다.\n",
+    "3. 추출 결과를 시각화하고 DataFrame으로 정리합니다.\n",
+    "\n",
+    "## API 개요\n",
+    "```python\n",
+    "# 개체 인식\n",
+    "comprehend.detect_entities(Text='...', LanguageCode='ko')\n",
+    "\n",
+    "# 핵심 문구 추출\n",
+    "comprehend.detect_key_phrases(Text='...', LanguageCode='ko')\n",
+    "```\n",
+    "\n",
+    "### Entity 타입\n",
+    "```\n",
+    "PERSON  LOCATION  ORGANIZATION  DATE  QUANTITY\n",
+    "TITLE   EVENT     COMMERCIAL_ITEM  OTHER\n",
+    "```\n",
+    "\n",
+    "### Entity 결과 구조\n",
+    "```\n",
+    "{\n",
+    "  'Text': 'Amazon',\n",
+    "  'Type': 'ORGANIZATION',\n",
+    "  'Score': 0.998,\n",
+    "  'BeginOffset': 0,\n",
+    "  'EndOffset': 6\n",
+    "}\n",
+    "```\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "---\n",
+    "## 🏢 기업 시나리오 — 홍보(PR)팀 미디어 모니터링\n",
+    "\n",
+    "당신은 기업 홍보팀의 **미디어 모니터링 담당자**입니다.\n",
+    "매일 자사·경쟁사 관련 **기사와 SNS 게시물이 수백 건** 올라옵니다.\n",
+    "\n",
+    "이번 실습에서는 Comprehend로 다음을 자동화합니다.\n",
+    "1. **개체 인식(NER)** → 기사에서 언급된 기업·인물·제품·날짜를 자동 추출\n",
+    "2. **핵심 문구 추출** → 그날의 주요 이슈를 한 줄로 요약\n",
+    "\n",
+    "> 💡 추출 결과를 매일 집계하면 '자사 vs 경쟁사 언급량 추이', '오늘의 핫이슈 키워드' 같은 일일 미디어 브리핑이 자동으로 만들어집니다.\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "s2_01",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# ✅ [제공 코드] 환경 초기화\n",
+    "import boto3\n",
+    "import matplotlib.pyplot as plt\n",
+    "import matplotlib.patches as mpatches\n",
+    "import pandas as pd\n",
+    "from collections import Counter\n",
+    "\n",
+    "# 한글 폰트 설정 (SageMaker Studio) — 최초 1회만 설치, 이후 즉시 로드\n",
+    "try:\n",
+    "    import koreanize_matplotlib\n",
+    "except ImportError:\n",
+    "    import sys, subprocess\n",
+    "    subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', 'koreanize-matplotlib'])\n",
+    "    import koreanize_matplotlib\n",
+    "\n",
+    "comprehend = boto3.client('comprehend', region_name='ap-northeast-2')\n",
+    "print('✅ Comprehend 클라이언트 생성 완료 (서울 ap-northeast-2)')\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "s2_02",
+   "metadata": {},
+   "source": [
+    "## ✏️ TODO 1: detect_entities — 개체 인식\n",
+    "\n",
+    "뉴스 기사 텍스트에서 개체를 추출하고 유형별로 분류하세요.\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "s2_03",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# ✏️ TODO 1: detect_entities API를 호출하고 결과를 출력하세요\n",
+    "news_text = \"\"\"\n",
+    "2024년 3월 15일, 삼성전자는 서울 강남구 삼성 서초사옥에서 갤럭시 S25를 공식 출시했습니다.\n",
+    "CEO 이재용 부회장이 직접 발표를 진행했으며, 애플의 아이폰 15와의 경쟁에서\n",
+    "우위를 점할 것으로 기대된다고 밝혔습니다. 출시 행사에는 약 500명의 기자가 참석했습니다.\n",
+    "\"\"\"\n",
+    "\n",
+    "response = comprehend.detect_entities(\n",
+    "    Text=_____,           # ← news_text\n",
+    "    LanguageCode=_____    # ← 'ko'\n",
+    ")\n",
+    "\n",
+    "entities = response[_____]  # ← 'Entities'\n",
+    "print(f'감지된 개체: {len(entities)}개')\n",
+    "print('-' * 60)\n",
+    "for e in entities:\n",
+    "    print(f\"  [{e[_____]:<20}] {e['Text']:<20} (신뢰도: {e['Score']:.3f})\")  # ← 'Type'\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "s2_04",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# ✅ [제공 코드] 개체 유형별 시각화\n",
+    "type_colors = {\n",
+    "    'PERSON':'#3498db', 'LOCATION':'#2ecc71', 'ORGANIZATION':'#e74c3c',\n",
+    "    'DATE':'#f39c12', 'QUANTITY':'#9b59b6', 'COMMERCIAL_ITEM':'#1abc9c',\n",
+    "    'OTHER':'#95a5a6', 'TITLE':'#e67e22', 'EVENT':'#34495e'\n",
+    "}\n",
+    "type_counts = Counter(e['Type'] for e in entities)\n",
+    "labels = list(type_counts.keys())\n",
+    "sizes  = list(type_counts.values())\n",
+    "colors = [type_colors.get(l, '#95a5a6') for l in labels]\n",
+    "\n",
+    "plt.figure(figsize=(8,4))\n",
+    "plt.bar(labels, sizes, color=colors)\n",
+    "plt.title('개체 유형별 분포')\n",
+    "plt.ylabel('개수')\n",
+    "plt.xticks(rotation=30, ha='right')\n",
+    "plt.tight_layout()\n",
+    "plt.show()\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "s2_05",
+   "metadata": {},
+   "source": [
+    "## ✏️ TODO 2: detect_key_phrases — 핵심 문구 추출\n",
+    "\n",
+    "텍스트에서 핵심 명사구를 추출하고 신뢰도 순으로 정렬하세요.\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "s2_06",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# ✏️ TODO 2: detect_key_phrases API를 호출하고 결과를 정리하세요\n",
+    "article = \"\"\"\n",
+    "인공지능 기술의 급속한 발전으로 의료 분야에서 혁신적인 변화가 일어나고 있습니다.\n",
+    "딥러닝 기반 진단 시스템은 암 조기 발견 정확도를 90% 이상으로 높였으며,\n",
+    "자연어처리 기술을 활용한 의료 챗봇은 환자 상담 서비스를 24시간 제공합니다.\n",
+    "\"\"\"\n",
+    "\n",
+    "response = comprehend.detect_key_phrases(\n",
+    "    Text=_____,           # ← article\n",
+    "    LanguageCode=_____    # ← 'ko'\n",
+    ")\n",
+    "\n",
+    "phrases = response[_____]  # ← 'KeyPhrases'\n",
+    "\n",
+    "# 신뢰도 기준 내림차순 정렬\n",
+    "phrases_sorted = sorted(phrases, key=lambda x: x[_____], reverse=True)  # ← 'Score'\n",
+    "\n",
+    "print(f'추출된 핵심 문구: {len(phrases)}개')\n",
+    "print('-' * 50)\n",
+    "for p in phrases_sorted[:10]:\n",
+    "    print(f\"  {p['Score']:.3f}  {p['Text']}\")\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "s2_07",
+   "metadata": {},
+   "source": [
+    "## ✏️ TODO 3: 개체 & 핵심문구 통합 분석\n",
+    "\n",
+    "동일 텍스트에 대해 개체 인식과 핵심 문구를 동시에 분석하고 DataFrame으로 합쳐 저장하세요.\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "s2_08",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# ✏️ TODO 3: 개체 인식과 핵심 문구를 동시에 분석하여 DataFrame으로 저장하세요\n",
+    "combined_text = \"\"\"\n",
+    "구글은 2023년 12월 뉴욕에서 Gemini Pro를 발표했습니다.\n",
+    "이는 ChatGPT에 대응하는 구글의 핵심 AI 전략으로,\n",
+    "클라우드 서비스와 검색 엔진에 통합될 예정입니다.\n",
+    "\"\"\"\n",
+    "\n",
+    "# 두 API 동시 호출\n",
+    "ent_resp = comprehend.detect_entities(Text=combined_text, LanguageCode='ko')\n",
+    "kp_resp  = comprehend.detect_key_phrases(Text=combined_text, LanguageCode='ko')\n",
+    "\n",
+    "# 개체 DataFrame\n",
+    "df_ent = pd.DataFrame([\n",
+    "    {'구분':'개체', '텍스트': e['Text'], '유형': e[_____], '신뢰도': round(e['Score'],3)}  # ← 'Type'\n",
+    "    for e in ent_resp['Entities']\n",
+    "])\n",
+    "\n",
+    "# 핵심문구 DataFrame\n",
+    "df_kp = pd.DataFrame([\n",
+    "    {'구분':'핵심문구', '텍스트': p['Text'], '유형': '-', '신뢰도': round(p[_____],3)}  # ← 'Score'\n",
+    "    for p in kp_resp['KeyPhrases']\n",
+    "])\n",
+    "\n",
+    "df_all = pd.concat([df_ent, df_kp], ignore_index=True)\n",
+    "df_all.to_csv('lab02_result.csv', index=False, encoding='utf-8-sig')\n",
+    "print(df_all.to_string(index=False))\n",
+    "print('\\n✅ lab02_result.csv 저장 완료')\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "---\n",
+    "## 🔗 실무로 연결하기\n",
+    "\n",
+    "`뉴스/SNS 수집(크롤러·API)` → `Comprehend(개체+핵심문구)` → `집계 DB` → `일일 브리핑 리포트`\n",
+    "\n",
+    "- ORGANIZATION 개체를 집계하면 **브랜드 언급량 추이 그래프**가 됩니다.\n",
+    "- 핵심 문구를 모으면 **이슈 키워드 클라우드**가 되어 위기(부정 이슈)를 조기에 감지합니다.\n",
+    "- 경쟁사명을 함께 추적하면 **경쟁 동향 모니터링**이 됩니다.\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "s2_09",
+   "metadata": {},
+   "source": [
+    "## 💡 심화 도전\n",
+    "1. 동일 텍스트에서 같은 인물이 여러 번 언급될 경우 중복 제거 후 집계해보세요.\n",
+    "2. LOCATION 유형 개체만 추출하여 지도 시각화(folium) 아이디어를 설계해보세요.\n",
+    "3. 뉴스 기사 5개를 수집하여 가장 많이 등장하는 조직(ORGANIZATION)을 순위로 출력하세요.\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "s2_10",
+   "metadata": {},
+   "source": [
+    "## ✅ 정답 코드\n",
+    "\n",
+    "👆 모두 풀고 난 후 확인하세요\n",
+    "\n",
+    "```python\n",
+    "# TODO 1\n",
+    "response = comprehend.detect_entities(Text=news_text, LanguageCode='ko')\n",
+    "entities = response['Entities']\n",
+    "print(f\"  [{e['Type']:<20}] {e['Text']:<20} ...\")\n",
+    "\n",
+    "# TODO 2\n",
+    "response = comprehend.detect_key_phrases(Text=article, LanguageCode='ko')\n",
+    "phrases = response['KeyPhrases']\n",
+    "phrases_sorted = sorted(phrases, key=lambda x: x['Score'], reverse=True)\n",
+    "\n",
+    "# TODO 3\n",
+    "{'구분':'개체', '텍스트': e['Text'], '유형': e['Type'], '신뢰도': round(e['Score'],3)}\n",
+    "{'구분':'핵심문구', '텍스트': p['Text'], '유형': '-', '신뢰도': round(p['Score'],3)}\n",
+    "```\n"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3 (ipykernel)",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.12.13"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "id": "s3_00",
+   "metadata": {},
+   "source": [
+    "# 실습 3: 대상 감성 분석 & PII 감지\n",
+    "**소요시간: 30분** | 난이도: ⭐⭐⭐\n",
+    "\n",
+    "## 학습 목표\n",
+    "1. `detect_targeted_sentiment`로 개체별 세밀한 감성을 분석합니다.\n",
+    "2. `detect_pii_entities`로 개인식별정보(PII)를 자동 감지합니다.\n",
+    "3. PII를 마스킹 처리하는 함수를 구현합니다.\n",
+    "\n",
+    "## API 개요\n",
+    "```python\n",
+    "# 대상 감성 분석 (개체별 감성)\n",
+    "comprehend.detect_targeted_sentiment(Text='...', LanguageCode='en')\n",
+    "\n",
+    "# PII 감지\n",
+    "comprehend.detect_pii_entities(Text='...', LanguageCode='en')\n",
+    "```\n",
+    "\n",
+    "### Targeted Sentiment 결과 구조\n",
+    "```\n",
+    "{\n",
+    "  'Text': 'battery life',\n",
+    "  'Type': 'ATTRIBUTE',\n",
+    "  'Mentions': [{\n",
+    "    'Text': 'battery life',\n",
+    "    'MentionSentiment': {'Sentiment': 'POSITIVE', 'SentimentScore': {...}}\n",
+    "  }]\n",
+    "}\n",
+    "```\n",
+    "\n",
+    "> ⚠️ detect_targeted_sentiment 및 detect_pii_entities는 **영어(en)**만 지원합니다.\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "---\n",
+    "## 🏢 기업 시나리오 — 금융 콜센터 품질·정보보호팀\n",
+    "\n",
+    "당신은 금융사 콜센터의 **상담 품질·개인정보보호 담당자**입니다.\n",
+    "매일 **수천 건의 상담 기록**이 텍스트로 쌓입니다.\n",
+    "\n",
+    "이번 실습에서는 Comprehend로 다음을 자동화합니다.\n",
+    "1. **대상 감성 분석(Targeted Sentiment)** → 고객이 '카드·앱·상담원' 중 무엇에 만족/불만인지 항목별 파악\n",
+    "2. **PII 감지·마스킹** → 상담 기록 속 이름·카드번호·연락처 등 개인정보를 자동 탐지·가림 처리\n",
+    "\n",
+    "> ⚠️ 대상 감성·PII 감지는 **영어(en)만 지원**하므로 이번 실습 데이터는 영어이며, 리전은 **us-east-1**을 사용합니다.\n",
+    "> 💡 실무에서는 분석팀에 상담 로그를 넘기기 전에 PII를 자동 마스킹해 **개인정보보호법·규정 준수**를 보장합니다.\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "s3_01",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# ✅ [제공 코드] 환경 초기화\n",
+    "import boto3\n",
+    "import matplotlib.pyplot as plt\n",
+    "import pandas as pd\n",
+    "import re\n",
+    "\n",
+    "# 한글 폰트 설정 (SageMaker Studio) — 최초 1회만 설치, 이후 즉시 로드\n",
+    "try:\n",
+    "    import koreanize_matplotlib\n",
+    "except ImportError:\n",
+    "    import sys, subprocess\n",
+    "    subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', 'koreanize-matplotlib'])\n",
+    "    import koreanize_matplotlib\n",
+    "\n",
+    "# ⚠️ 대상 감성(targeted_sentiment)·PII 감지는 영어(en)만 지원 → us-east-1 사용\n",
+    "comprehend = boto3.client('comprehend', region_name='us-east-1')\n",
+    "print('✅ Comprehend 클라이언트 생성 완료 (us-east-1)')\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "s3_02",
+   "metadata": {},
+   "source": [
+    "## ✏️ TODO 1: detect_targeted_sentiment — 개체별 감성 분석\n",
+    "\n",
+    "제품 리뷰에서 각 개체(배터리, 카메라, 디자인 등)별 감성을 개별 분석하세요.\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "s3_03",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# ✏️ TODO 1: detect_targeted_sentiment API를 호출하고 개체별 감성을 출력하세요\n",
+    "review = (\n",
+    "    \"The camera quality is absolutely stunning and takes great photos. \"\n",
+    "    \"However, the battery life is terrible and drains too fast. \"\n",
+    "    \"The design looks premium but the screen has some issues.\"\n",
+    ")\n",
+    "\n",
+    "response = comprehend.detect_targeted_sentiment(\n",
+    "    Text=_____,           # ← review\n",
+    "    LanguageCode=_____    # ← 'en'\n",
+    ")\n",
+    "\n",
+    "entities = response[_____]  # ← 'Entities'\n",
+    "print(f'분석된 개체: {len(entities)}개')\n",
+    "print('-' * 60)\n",
+    "for e in entities:\n",
+    "    mention = e['Mentions'][0]\n",
+    "    text     = mention[_____]                                # ← 'Text'\n",
+    "    sent     = mention['MentionSentiment'][_____]            # ← 'Sentiment'\n",
+    "    score    = mention['MentionSentiment']['SentimentScore']\n",
+    "    dominant = max(score, key=score.get)\n",
+    "    print(f\"  {text:<20} → {sent:<12} (최고: {dominant} {score[dominant]:.3f})\")\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "s3_04",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# ✅ [제공 코드] 개체별 감성 비교 시각화\n",
+    "rows = []\n",
+    "for e in entities:\n",
+    "    m    = e['Mentions'][0]\n",
+    "    sc   = m['MentionSentiment']['SentimentScore']\n",
+    "    rows.append({'entity': m['Text'], 'sentiment': m['MentionSentiment']['Sentiment'],\n",
+    "                 'pos': sc['Positive'], 'neg': sc['Negative']})\n",
+    "df = pd.DataFrame(rows).drop_duplicates('entity')\n",
+    "\n",
+    "fig, ax = plt.subplots(figsize=(10, 4))\n",
+    "x = range(len(df))\n",
+    "ax.bar([i-0.2 for i in x], df['pos'], 0.35, label='Positive', color='#2ecc71')\n",
+    "ax.bar([i+0.2 for i in x], df['neg'], 0.35, label='Negative', color='#e74c3c')\n",
+    "ax.set_xticks(list(x))\n",
+    "ax.set_xticklabels(df['entity'], rotation=20, ha='right')\n",
+    "ax.set_title('개체별 감성 점수 (Targeted Sentiment)')\n",
+    "ax.set_ylim(0, 1)\n",
+    "ax.legend()\n",
+    "plt.tight_layout()\n",
+    "plt.show()\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "s3_05",
+   "metadata": {},
+   "source": [
+    "## ✏️ TODO 2: detect_pii_entities — PII 감지\n",
+    "\n",
+    "텍스트에서 개인식별정보(이름, 이메일, 전화번호, 주소 등)를 감지하세요.\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "s3_06",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# ✏️ TODO 2: detect_pii_entities API를 호출하고 결과를 출력하세요\n",
+    "pii_text = (\n",
+    "    \"Hello, my name is John Smith. You can reach me at john.smith@email.com \"\n",
+    "    \"or call me at 555-123-4567. My address is 123 Main Street, New York, NY 10001. \"\n",
+    "    \"My credit card number is 4532-1234-5678-9012.\"\n",
+    ")\n",
+    "\n",
+    "response = comprehend.detect_pii_entities(\n",
+    "    Text=_____,           # ← pii_text\n",
+    "    LanguageCode=_____    # ← 'en'\n",
+    ")\n",
+    "\n",
+    "pii_entities = response[_____]  # ← 'Entities'\n",
+    "print(f'감지된 PII: {len(pii_entities)}개')\n",
+    "print('-' * 60)\n",
+    "for p_ent in pii_entities:\n",
+    "    start = p_ent[_____]   # ← 'BeginOffset'\n",
+    "    end   = p_ent[_____]   # ← 'EndOffset'\n",
+    "    text  = pii_text[start:end]\n",
+    "    print(f\"  [{p_ent['Type']:<20}] {text:<30} (신뢰도: {p_ent['Score']:.3f})\")\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "s3_06b",
+   "metadata": {},
+   "source": [
+    "## ✏️ TODO 3: PII 마스킹 함수 구현\n",
+    "\n",
+    "감지된 PII를 `***` 로 치환하는 마스킹 함수를 완성하세요.\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "s3_07",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# ✏️ TODO 3: PII를 마스킹하는 함수를 완성하세요\n",
+    "def mask_pii(text, pii_entities):\n",
+    "    \"\"\"PII 위치를 뒤에서부터 치환하여 offset 오염 방지\"\"\"\n",
+    "    sorted_entities = sorted(pii_entities,\n",
+    "                              key=lambda x: x[_____],  # ← 'BeginOffset'\n",
+    "                              reverse=_____)           # ← True  (뒤에서부터)\n",
+    "    masked = text\n",
+    "    for ent in sorted_entities:\n",
+    "        start  = ent[_____]  # ← 'BeginOffset'\n",
+    "        end    = ent[_____]  # ← 'EndOffset'\n",
+    "        marker = f\"[{ent['Type']}]\"\n",
+    "        masked = masked[:start] + marker + masked[end:]\n",
+    "    return masked\n",
+    "\n",
+    "masked_text = mask_pii(pii_text, pii_entities)\n",
+    "print('원본:')\n",
+    "print(' ', pii_text)\n",
+    "print('\\n마스킹 결과:')\n",
+    "print(' ', masked_text)\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "---\n",
+    "## 🔗 실무로 연결하기\n",
+    "\n",
+    "`상담 로그(텍스트)` → `PII 자동 마스킹` → `(안전한) 분석용 데이터` → `품질·만족도 분석`\n",
+    "\n",
+    "- 항목별 감성을 집계하면 **'어떤 기능에 불만이 집중되는지'** 가 보입니다 → 제품 개선 우선순위\n",
+    "- PII 마스킹 자동화로 **사람이 직접 가릴 필요가 없어** 휴먼 에러와 규정 위반 위험을 제거합니다.\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "s3_08",
+   "metadata": {},
+   "source": [
+    "## 💡 심화 도전\n",
+    "1. 동일 제품 리뷰에서 detect_sentiment(전체)와 detect_targeted_sentiment(개체별)의 결과를 비교해보세요.\n",
+    "2. 고객 상담 로그에서 PII를 마스킹하는 배치 처리 파이프라인을 설계해보세요.\n",
+    "3. PII 유형별 빈도를 집계하여 어떤 PII가 가장 많이 노출되는지 분석해보세요.\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "s3_09",
+   "metadata": {},
+   "source": [
+    "## ✅ 정답 코드\n",
+    "\n",
+    "👆 모두 풀고 난 후 확인하세요\n",
+    "\n",
+    "```python\n",
+    "# TODO 1\n",
+    "response = comprehend.detect_targeted_sentiment(Text=review, LanguageCode='en')\n",
+    "entities = response['Entities']\n",
+    "text  = mention['Text']\n",
+    "sent  = mention['MentionSentiment']['Sentiment']\n",
+    "\n",
+    "# TODO 2\n",
+    "response = comprehend.detect_pii_entities(Text=pii_text, LanguageCode='en')\n",
+    "pii_entities = response['Entities']\n",
+    "start = p_ent['BeginOffset']\n",
+    "end   = p_ent['EndOffset']\n",
+    "\n",
+    "# TODO 3\n",
+    "sorted_entities = sorted(pii_entities, key=lambda x: x['BeginOffset'], reverse=True)\n",
+    "start  = ent['BeginOffset']\n",
+    "end    = ent['EndOffset']\n",
+    "```\n"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3 (ipykernel)",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.12.13"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "id": "s4_00",
+   "metadata": {},
+   "source": [
+    "# 실습 4: 구문 분석 & 종합 텍스트 분석 파이프라인\n",
+    "**소요시간: 30분** | 난이도: ⭐⭐⭐⭐\n",
+    "\n",
+    "## 학습 목표\n",
+    "1. `detect_syntax`로 품사(POS) 태깅을 수행합니다.\n",
+    "2. 앞서 배운 API를 통합하는 **종합 분석 파이프라인**을 구현합니다.\n",
+    "3. 분석 결과를 JSON/CSV로 저장하고 시각화 대시보드를 만듭니다.\n",
+    "\n",
+    "## API 개요\n",
+    "```python\n",
+    "# 구문 분석 (품사 태깅)\n",
+    "comprehend.detect_syntax(Text='...', LanguageCode='en')\n",
+    "```\n",
+    "\n",
+    "### 주요 품사 태그\n",
+    "```\n",
+    "NOUN  VERB  ADJ  ADV  PROPN(고유명사)\n",
+    "DET   ADP   CONJ  PUNCT  NUM\n",
+    "```\n",
+    "\n",
+    "### Syntax 결과 구조\n",
+    "```\n",
+    "{\n",
+    "  'TokenId': 1,\n",
+    "  'Text': 'The',\n",
+    "  'PartOfSpeech': {'Tag': 'DET', 'Score': 0.999},\n",
+    "  'BeginOffset': 0, 'EndOffset': 3\n",
+    "}\n",
+    "```\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "---\n",
+    "## 🏢 기업 시나리오 — 데이터팀의 VOC 자동 분석 시스템\n",
+    "\n",
+    "당신은 **데이터 엔지니어**입니다.\n",
+    "지금까지 배운 기능(언어감지·감성·개체인식·핵심문구)을 **하나의 파이프라인**으로 묶어,\n",
+    "고객의 소리(VOC)를 자동 분석하는 시스템을 만듭니다.\n",
+    "\n",
+    "이번 실습에서는 다음을 구현합니다.\n",
+    "1. **구문 분석(Syntax)** → 품사 태깅으로 텍스트 구조 파악\n",
+    "2. **종합 분석 함수** → 4개 API를 하나의 `analyze_text()`로 통합\n",
+    "3. **결과 적재 + 대시보드** → JSON/CSV 저장 및 시각화\n",
+    "\n",
+    "> 💡 실무에서는 이 `analyze_text()` 파이프라인을 **AWS Lambda**로 배포해, 새 리뷰가 들어올 때마다 실시간으로 자동 분석합니다.\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "s4_01",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# ✅ [제공 코드] 환경 초기화\n",
+    "import boto3, json, os\n",
+    "import matplotlib.pyplot as plt\n",
+    "import pandas as pd\n",
+    "from collections import Counter\n",
+    "\n",
+    "# 한글 폰트 설정 (SageMaker Studio) — 최초 1회만 설치, 이후 즉시 로드\n",
+    "try:\n",
+    "    import koreanize_matplotlib\n",
+    "except ImportError:\n",
+    "    import sys, subprocess\n",
+    "    subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', 'koreanize-matplotlib'])\n",
+    "    import koreanize_matplotlib\n",
+    "\n",
+    "comprehend = boto3.client('comprehend', region_name='us-east-1')\n",
+    "os.makedirs('./lab04_output', exist_ok=True)\n",
+    "print('✅ 환경 초기화 완료 (us-east-1)')\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "s4_02",
+   "metadata": {},
+   "source": [
+    "## ✏️ TODO 1: detect_syntax — 품사 태깅\n",
+    "\n",
+    "텍스트를 형태소 단위로 분석하고 품사 분포를 시각화하세요.\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "s4_03",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# ✏️ TODO 1: detect_syntax API를 호출하고 품사 분포를 출력하세요\n",
+    "syntax_text = (\n",
+    "    \"Amazon Web Services provides reliable cloud computing solutions \"\n",
+    "    \"that help businesses scale quickly and efficiently.\"\n",
+    ")\n",
+    "\n",
+    "response = comprehend.detect_syntax(\n",
+    "    Text=_____,           # ← syntax_text\n",
+    "    LanguageCode=_____    # ← 'en'\n",
+    ")\n",
+    "\n",
+    "tokens = response[_____]  # ← 'SyntaxTokens'\n",
+    "print(f'토큰 수: {len(tokens)}개')\n",
+    "print('-' * 50)\n",
+    "for tok in tokens:\n",
+    "    pos  = tok['PartOfSpeech'][_____]   # ← 'Tag'\n",
+    "    conf = tok['PartOfSpeech'][_____]   # ← 'Score'\n",
+    "    print(f\"  {tok['Text']:<15} {pos:<8} ({conf:.3f})\")\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "s4_04",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# ✅ [제공 코드] 품사 분포 시각화\n",
+    "pos_counts = Counter(t['PartOfSpeech']['Tag'] for t in tokens)\n",
+    "labels = list(pos_counts.keys())\n",
+    "sizes  = list(pos_counts.values())\n",
+    "\n",
+    "plt.figure(figsize=(9, 4))\n",
+    "plt.bar(labels, sizes, color='#3498db')\n",
+    "plt.title('품사 분포 (Part-of-Speech)')\n",
+    "plt.ylabel('빈도')\n",
+    "plt.tight_layout()\n",
+    "plt.show()\n",
+    "\n",
+    "nouns = [t['Text'] for t in tokens if t['PartOfSpeech']['Tag'] in ('NOUN','PROPN')]\n",
+    "print('주요 명사/고유명사:', nouns)\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "s4_05",
+   "metadata": {},
+   "source": [
+    "## ✏️ TODO 2: 종합 분석 파이프라인 구현\n",
+    "\n",
+    "언어 감지 → 감성 분석 → 개체 인식 → 핵심 문구 추출을 하나의 함수로 통합하세요.\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "s4_06",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# ✏️ TODO 2: analyze_text() 통합 파이프라인 함수를 완성하세요\n",
+    "def analyze_text(text, lang='ko'):\n",
+    "    \"\"\"Comprehend 종합 분석 파이프라인\"\"\"\n",
+    "    result = {'text': text, 'language': lang}\n",
+    "\n",
+    "    # 1단계: 언어 자동 감지\n",
+    "    lang_resp = comprehend.detect_dominant_language(Text=_____) # ← text\n",
+    "    detected_lang = lang_resp['Languages'][0][_____]             # ← 'LanguageCode'\n",
+    "    result['detected_language'] = detected_lang\n",
+    "\n",
+    "    # 2단계: 감성 분석\n",
+    "    sent_resp = comprehend.detect_sentiment(\n",
+    "        Text=_____, LanguageCode=_____   # ← text, detected_lang\n",
+    "    )\n",
+    "    result['sentiment']       = sent_resp[_____]          # ← 'Sentiment'\n",
+    "    result['sentiment_scores']= sent_resp[_____]          # ← 'SentimentScore'\n",
+    "\n",
+    "    # 3단계: 개체 인식\n",
+    "    ent_resp = comprehend.detect_entities(\n",
+    "        Text=_____, LanguageCode=_____   # ← text, detected_lang\n",
+    "    )\n",
+    "    result['entities'] = [\n",
+    "        {'text': e['Text'], 'type': e['Type'], 'score': round(e['Score'],3)}\n",
+    "        for e in ent_resp[_____]         # ← 'Entities'\n",
+    "    ]\n",
+    "\n",
+    "    # 4단계: 핵심 문구\n",
+    "    kp_resp = comprehend.detect_key_phrases(\n",
+    "        Text=_____, LanguageCode=_____   # ← text, detected_lang\n",
+    "    )\n",
+    "    result['key_phrases'] = [p['Text'] for p in kp_resp[_____]]  # ← 'KeyPhrases'\n",
+    "\n",
+    "    return result\n",
+    "\n",
+    "# 테스트\n",
+    "test = '삼성전자가 2024년 서울에서 AI 반도체 신제품을 발표했습니다.'\n",
+    "out  = analyze_text(test)\n",
+    "print(f\"언어: {out['detected_language']}\")\n",
+    "print(f\"감성: {out['sentiment']}\")\n",
+    "print(f\"개체: {out['entities']}\")\n",
+    "print(f\"핵심문구: {out['key_phrases']}\")\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "s4_07",
+   "metadata": {},
+   "source": [
+    "## ✏️ TODO 3: 배치 파이프라인 & 결과 저장\n",
+    "\n",
+    "여러 뉴스 헤드라인을 파이프라인으로 처리하고 결과를 JSON과 CSV로 저장하세요.\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "s4_08",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# ✏️ TODO 3: 여러 텍스트를 파이프라인으로 처리하고 결과를 저장하세요\n",
+    "headlines = [\n",
+    "    '현대차, 전기차 신모델 출시로 테슬라와 본격 경쟁 선언',\n",
+    "    '코스피 3,000선 돌파, 외국인 투자자 대규모 순매수',\n",
+    "    'BTS 월드투어 티켓 매진, 팬들 아쉬움 토로',\n",
+    "    '기상청, 이번 주말 전국 폭설 예보',\n",
+    "]\n",
+    "\n",
+    "all_results = []\n",
+    "for i, h in enumerate(headlines):\n",
+    "    print(f'처리 중 [{i+1}/{len(headlines)}]: {h[:25]}...')\n",
+    "    r = _____(h)            # ← analyze_text\n",
+    "    all_results.append(r)\n",
+    "\n",
+    "# JSON 저장\n",
+    "with open('./lab04_output/results.json', _____) as f:   # ← 'w'\n",
+    "    json.dump(_____, f, ensure_ascii=False, indent=2)   # ← all_results\n",
+    "print('\\n✅ results.json 저장 완료')\n",
+    "\n",
+    "# CSV 저장\n",
+    "df = pd.DataFrame([{\n",
+    "    '헤드라인': r['text'][:30],\n",
+    "    '감성'    : r[_____],                                # ← 'sentiment'\n",
+    "    '개체수'  : len(r['entities']),\n",
+    "    '핵심문구': ', '.join(r['key_phrases'][:3])\n",
+    "} for r in all_results])\n",
+    "df.to_csv('./lab04_output/results.csv', index=False, encoding='utf-8-sig')\n",
+    "print('✅ results.csv 저장 완료')\n",
+    "print(df.to_string(index=False))\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "s4_09",
+   "metadata": {},
+   "source": [
+    "## ✏️ TODO 4: 종합 시각화 대시보드\n",
+    "\n",
+    "분석 결과를 2×2 서브플롯 대시보드로 시각화하세요.\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "s4_10",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# ✏️ TODO 4: 분석 결과를 2×2 대시보드로 시각화하세요\n",
+    "fig, axes = plt.subplots(2, 2, figsize=(13, 9))\n",
+    "\n",
+    "# [0,0] 감성 분포 파이차트\n",
+    "sent_counts = Counter(r[_____] for r in all_results)  # ← 'sentiment'\n",
+    "colors_map  = {'POSITIVE':'#2ecc71','NEGATIVE':'#e74c3c','NEUTRAL':'#95a5a6','MIXED':'#f39c12'}\n",
+    "axes[0,0].pie(\n",
+    "    sent_counts.values(),\n",
+    "    labels=sent_counts.keys(),\n",
+    "    colors=[colors_map.get(k,'#95a5a6') for k in sent_counts.keys()],\n",
+    "    autopct='%1.0f%%'\n",
+    ")\n",
+    "axes[0,0].set_title('감성 분포')\n",
+    "\n",
+    "# [0,1] 개체 유형 분포\n",
+    "all_ent_types = [e['type'] for r in all_results for e in r['entities']]\n",
+    "ent_cnt = Counter(all_ent_types)\n",
+    "axes[0,1].bar(ent_cnt.keys(), ent_cnt.values(), color='#3498db')\n",
+    "axes[0,1].set_title('개체 유형 분포')\n",
+    "axes[0,1].tick_params(axis='x', rotation=30)\n",
+    "\n",
+    "# [1,0] 헤드라인별 개체 수\n",
+    "ent_counts = [len(r['entities']) for r in all_results]\n",
+    "short_labels = [r['text'][:12]+'...' for r in all_results]\n",
+    "axes[1,0].barh(short_labels, _____, color='#9b59b6')  # ← ent_counts\n",
+    "axes[1,0].set_title('헤드라인별 개체 수')\n",
+    "\n",
+    "# [1,1] 헤드라인별 핵심 문구 수\n",
+    "kp_counts = [len(r['key_phrases']) for r in all_results]\n",
+    "axes[1,1].bar(range(len(headlines)), _____, color='#e67e22')  # ← kp_counts\n",
+    "axes[1,1].set_xticks(range(len(headlines)))\n",
+    "axes[1,1].set_xticklabels([f'뉴스{i+1}' for i in range(len(headlines))])\n",
+    "axes[1,1].set_title('헤드라인별 핵심 문구 수')\n",
+    "\n",
+    "plt.suptitle('Amazon Comprehend 종합 분석 대시보드', fontsize=14, fontweight='bold')\n",
+    "plt.tight_layout()\n",
+    "plt.savefig('./lab04_output/dashboard.png', dpi=150)\n",
+    "plt.show()\n",
+    "print('✅ dashboard.png 저장 완료')\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "---\n",
+    "## 🔗 실무로 연결하기 — 오늘 만든 것이 곧 실무 시스템\n",
+    "\n",
+    "오늘 4개 실습에서 만든 기능이 모이면 아래와 같은 **실무 VOC 분석 파이프라인**이 됩니다.\n",
+    "\n",
+    "`고객 리뷰·문의(S3)` → `Lambda` → `Comprehend(감성·개체·핵심문구·PII)` → `DB 적재` → `BI 대시보드`\n",
+    "\n",
+    "- 마케팅팀: 감성 추이로 캠페인 반응 측정\n",
+    "- CS팀: 부정 급증 시 자동 알림\n",
+    "- 보안팀: PII 자동 마스킹으로 규정 준수\n",
+    "\n",
+    "**축하합니다! 여러분은 방금 기업이 실제로 사용하는 텍스트 AI 파이프라인의 축소판을 완성했습니다.** 🎉\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "s4_11",
+   "metadata": {},
+   "source": [
+    "## 💡 심화 도전\n",
+    "1. 10개 이상의 뉴스 기사를 수집하여 날짜별 감성 트렌드를 꺾은선 그래프로 시각화하세요.\n",
+    "2. 가장 많이 언급된 ORGANIZATION(조직) Top 5를 추출하세요.\n",
+    "3. 파이프라인을 Lambda 함수로 배포하는 아키텍처를 설계해보세요.\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "s4_12",
+   "metadata": {},
+   "source": [
+    "## ✅ 정답 코드\n",
+    "\n",
+    "👆 모두 풀고 난 후 확인하세요\n",
+    "\n",
+    "```python\n",
+    "# TODO 1\n",
+    "response = comprehend.detect_syntax(Text=syntax_text, LanguageCode='en')\n",
+    "tokens = response['SyntaxTokens']\n",
+    "pos  = tok['PartOfSpeech']['Tag']\n",
+    "conf = tok['PartOfSpeech']['Score']\n",
+    "\n",
+    "# TODO 2\n",
+    "lang_resp = comprehend.detect_dominant_language(Text=text)\n",
+    "detected_lang = lang_resp['Languages'][0]['LanguageCode']\n",
+    "sent_resp = comprehend.detect_sentiment(Text=text, LanguageCode=detected_lang)\n",
+    "result['sentiment']        = sent_resp['Sentiment']\n",
+    "result['sentiment_scores'] = sent_resp['SentimentScore']\n",
+    "ent_resp = comprehend.detect_entities(Text=text, LanguageCode=detected_lang)\n",
+    "result['entities'] = [... for e in ent_resp['Entities']]\n",
+    "kp_resp = comprehend.detect_key_phrases(Text=text, LanguageCode=detected_lang)\n",
+    "result['key_phrases'] = [p['Text'] for p in kp_resp['KeyPhrases']]\n",
+    "\n",
+    "# TODO 3\n",
+    "r = analyze_text(h)\n",
+    "with open('./lab04_output/results.json', 'w') as f:\n",
+    "    json.dump(all_results, f, ensure_ascii=False, indent=2)\n",
+    "df = pd.DataFrame([{'감성': r['sentiment'], ...} for r in all_results])\n",
+    "\n",
+    "# TODO 4\n",
+    "sent_counts = Counter(r['sentiment'] for r in all_results)\n",
+    "axes[1,0].barh(short_labels, ent_counts, color='#9b59b6')\n",
+    "axes[1,1].bar(range(len(headlines)), kp_counts, color='#e67e22')\n",
+    "```\n"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3 (ipykernel)",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.12.13"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
